@@ -9,7 +9,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"strconv"
@@ -359,7 +358,6 @@ func (rec *record) ParseStdout() (response FCGIHTTPResponse, err error) {
 	for {
 		// getting headers
 		line, err := buf.ReadString('\n')
-		fmt.Println(line)
 		if err != nil {
 			break
 		}
@@ -368,7 +366,6 @@ func (rec *record) ParseStdout() (response FCGIHTTPResponse, err error) {
 		line = strings.TrimSuffix(line, "\r\n")
 		if len(line) != 0 {
 			header_arr := strings.SplitN(line, ": ", 2)
-			println(header_arr[0])
 			response.Headers[header_arr[0]] = header_arr[1]
 			if header_arr[0] == "Status" {
 				status_code_str := header_arr[1][:3]
