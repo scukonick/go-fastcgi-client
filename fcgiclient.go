@@ -8,11 +8,13 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
-	"sync"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strconv"
+	"strings"
+	"sync"
 )
 
 const FCGI_LISTENSOCK_FILENO uint8 = 0
@@ -73,6 +75,10 @@ type header struct {
 // not synchronized because we don't care what the contents are
 var pad [maxPad]byte
 
+// WrongRecordFormat is error returned by recordReader if
+// output from io is not in format of FCGI record
+var ErrInvalidRecord = errors.New("Wrong FCGI-record format")
+
 func (h *header) init(recType uint8, reqId uint16, contentLength int) {
 	h.Version = 1
 	h.Type = recType
@@ -84,6 +90,75 @@ func (h *header) init(recType uint8, reqId uint16, contentLength int) {
 type record struct {
 	h   header
 	buf [maxWrite + maxPad]byte
+}
+
+// FCGIResponse - whole answer from FCGI-server
+// which includes all stdouts, stderrs, etc
+type FCGIResponse struct {
+	Stdouts    []record
+	Stderrs    []record
+	EndRequest record
+}
+
+// recordsReader reads from io.Reader and
+// returns FCGI-records
+type recordReader struct {
+	r io.Reader
+}
+
+func newRecordReader(r io.Reader) (rr *recordReader) {
+	rr = &recordReader{r}
+	return
+}
+
+// readRecord reads fcgi record from
+// recordReader io.Reader and returns
+// FCGI-record
+func (rReader *recordReader) readRecord() (rec record, err error) {
+	err = binary.Read(rReader.r, binary.BigEndian, &rec.h)
+	if err != nil {
+		if err == io.EOF {
+			return
+		} else if err == io.ErrUnexpectedEOF {
+			err = ErrInvalidRecord
+			return
+		}
+	}
+	if rec.h.Version != 1 {
+		err = errors.New("fcgi: invalid header version")
+		return
+	}
+	n := int(rec.h.ContentLength) + int(rec.h.PaddingLength)
+	if _, err = io.ReadFull(rReader.r, rec.buf[:n]); err != nil {
+		return
+	}
+	return
+}
+
+// rReader reads everything from io.Reader and
+// returns FCGIResponse with all records from the stream
+func (rReader *recordReader) readRecords() (response FCGIResponse, err error) {
+	for {
+		rec, err := rReader.readRecord()
+		if err != nil {
+			if err == io.EOF { // Ok, we've processed all the stream
+				return response, nil
+			}
+			if err == ErrInvalidRecord { // Oops, wrong format
+				return response, err
+			}
+			return response, err // In case of unexpected error
+		}
+		switch rec.h.Type {
+		case FCGI_STDOUT:
+			response.Stdouts = append(response.Stdouts, rec)
+		case FCGI_STDERR:
+			response.Stderrs = append(response.Stderrs, rec)
+		case FCGI_END_REQUEST:
+			response.EndRequest = rec
+		}
+
+	}
 }
 
 func (rec *record) read(r io.Reader) (err error) {
@@ -108,7 +183,7 @@ type FCGIClient struct {
 	mutex     sync.Mutex
 	rwc       io.ReadWriteCloser
 	h         header
-	buf 	  bytes.Buffer
+	buf       bytes.Buffer
 	keepAlive bool
 }
 
@@ -135,7 +210,7 @@ func New(h string, args ...interface{}) (fcgi *FCGIClient, err error) {
 	return
 }
 
-func (this *FCGIClient) writeRecord(recType uint8, reqId uint16, content []byte) ( err error) {
+func (this *FCGIClient) writeRecord(recType uint8, reqId uint16, content []byte) (err error) {
 	this.mutex.Lock()
 	defer this.mutex.Unlock()
 	this.buf.Reset()
@@ -184,7 +259,6 @@ func (this *FCGIClient) writePairs(recType uint8, reqId uint16, pairs map[string
 	w.Close()
 	return nil
 }
-
 
 func readSize(s []byte) (uint32, int) {
 	if len(s) == 0 {
@@ -269,11 +343,60 @@ func (w *streamWriter) Close() error {
 	return w.c.writeRecord(w.recType, w.reqId, nil)
 }
 
-func (this *FCGIClient) Request(env map[string]string, reqStr string) (ret []byte, err error) {
+// Struct which represents
+// HTTP-like response from the FCGI-server
+type FCGIHTTPResponse struct {
+	ResponseCode int
+	Content      []byte
+	Headers      map[string]string
+}
+
+// ParseContent parses raw response from FCGI-server
+// and returns result in FCGIRHTTPesponse object
+func (rec *record) ParseStdout() (response FCGIHTTPResponse, err error) {
+	buf := bytes.NewBuffer(rec.buf[:rec.h.ContentLength])
+	response.Headers = make(map[string]string)
+	for {
+		// getting headers
+		line, err := buf.ReadString('\n')
+		fmt.Println(line)
+		if err != nil {
+			break
+		}
+		// removing trailing \r\n
+
+		line = strings.TrimSuffix(line, "\r\n")
+		if len(line) != 0 {
+			header_arr := strings.SplitN(line, ": ", 2)
+			println(header_arr[0])
+			response.Headers[header_arr[0]] = header_arr[1]
+			if header_arr[0] == "Status" {
+				status_code_str := header_arr[1][:3]
+				response.ResponseCode, err = strconv.Atoi(status_code_str)
+			}
+		} else {
+			// end of headers
+			break
+		}
+
+	}
+	// only body left
+	body := make([]byte, buf.Len())
+	if response.ResponseCode == 0 {
+		response.ResponseCode = 200
+	}
+	buf.Read(body)
+	response.Content = body
+	return response, nil
+}
+
+// FCGIClient.Request send request to fastcgi server and
+// return FCGIResponse from it (including all the records in it)
+func (this *FCGIClient) Request(env map[string]string, reqStr string) (fcgiResponse FCGIResponse, err error) {
 
 	var reqId uint16 = 1
 
-	err = this.writeBeginRequest(reqId, uint16(FCGI_RESPONDER), 0)	
+	err = this.writeBeginRequest(reqId, uint16(FCGI_RESPONDER), 0)
 	if err != nil {
 		return
 	}
@@ -288,14 +411,7 @@ func (this *FCGIClient) Request(env map[string]string, reqStr string) (ret []byt
 		}
 	}
 
-
-	rec := &record{}
-	err = rec.read(this.rwc)
-	if err != nil {
-		return
-	}
-
-	ret = rec.content()
-
+	recReader := newRecordReader(this.rwc)
+	fcgiResponse, err = recReader.readRecords()
 	return
 }
