@@ -9,8 +9,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -239,8 +241,8 @@ func (this *FCGIClient) writeEndRequest(reqId uint16, appStatus int, protocolSta
 	return this.writeRecord(FCGI_END_REQUEST, reqId, b)
 }
 
-func (this *FCGIClient) writePairs(recType uint8, reqId uint16, pairs map[string]string) error {
-	w := newWriter(this, recType, reqId)
+func (client *FCGIClient) writePairs(recType uint8, reqId uint16, pairs map[string]string) error {
+	w := newWriter(client, recType, reqId)
 	b := make([]byte, 8)
 	for k, v := range pairs {
 		n := encodeSize(b, uint32(len(k)))
@@ -411,4 +413,43 @@ func (this *FCGIClient) Request(env map[string]string, reqStr string) (fcgiRespo
 	recReader := newRecordReader(this.rwc)
 	fcgiResponse, err = recReader.readRecords()
 	return
+}
+
+// Processes http.Request.Header and returns map of string to string
+// which we can use in the FCGI request
+// For now we support only unique headers
+func headers2env(header http.Header) map[string]string {
+	env := make(map[string]string)
+	for header_name, value := range header {
+		header_name := fmt.Sprintf("HTTP_%s", strings.ToUpper(header_name))
+		header_name = strings.Replace(header_name, "-", "_", -1)
+		env[header_name] = value[0]
+	}
+
+	return env
+}
+
+// FCGIClient.HTTPRequest - receives HTTP Request and send it to FCGI-server
+func (this *FCGIClient) DoHTTPRequest(http_request *http.Request, script_filename string) (*FCGIResponse, error) {
+
+	env := make(map[string]string)
+	env["REQUEST_METHOD"] = http_request.Method
+	env["SCRIPT_FILENAME"] = script_filename
+	env["SERVER_SOFTWARE"] = "go / fcgiclient"
+	env["REMOTE_ADDR"] = http_request.RemoteAddr
+	env["SERVER_PROTOCOL"] = http_request.Proto
+	env["REQUEST_URI"] = http_request.URL.Path
+	env["DOCUMENT_URI"] = http_request.URL.Path
+	env["SCRIPT_NAME"] = http_request.URL.Path
+	env["QUERY_STRING"] = http_request.URL.RawQuery
+
+	// HTTP Headers processing
+	headers_map := headers2env(http_request.Header)
+	for k, v := range headers_map {
+		env[k] = v
+	}
+	fmt.Printf("SCRIPT_NAME: %v\n", env["SCRIPT_NAME"])
+
+	fcgiResponse, err := this.Request(env, "")
+	return &fcgiResponse, err
 }
