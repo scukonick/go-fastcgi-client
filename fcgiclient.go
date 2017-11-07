@@ -78,7 +78,7 @@ var pad [maxPad]byte
 
 // WrongRecordFormat is error returned by recordReader if
 // output from io is not in format of FCGI record
-var ErrInvalidRecord = errors.New("Wrong FCGI-record format")
+var ErrInvalidRecord = errors.New("wrong FCGI-record format")
 
 func (h *header) init(recType uint8, reqId uint16, contentLength int) {
 	h.Version = 1
@@ -192,34 +192,34 @@ func New(h string, args ...interface{}) (fcgi *FCGIClient, err error) {
 	return
 }
 
-func (this *FCGIClient) writeRecord(recType uint8, reqId uint16, content []byte) (err error) {
-	this.mutex.Lock()
-	defer this.mutex.Unlock()
-	this.buf.Reset()
-	this.h.init(recType, reqId, len(content))
-	if err := binary.Write(&this.buf, binary.BigEndian, this.h); err != nil {
+func (client *FCGIClient) writeRecord(recType uint8, reqId uint16, content []byte) (err error) {
+	client.mutex.Lock()
+	defer client.mutex.Unlock()
+	client.buf.Reset()
+	client.h.init(recType, reqId, len(content))
+	if err := binary.Write(&client.buf, binary.BigEndian, client.h); err != nil {
 		return err
 	}
-	if _, err := this.buf.Write(content); err != nil {
+	if _, err := client.buf.Write(content); err != nil {
 		return err
 	}
-	if _, err := this.buf.Write(pad[:this.h.PaddingLength]); err != nil {
+	if _, err := client.buf.Write(pad[:client.h.PaddingLength]); err != nil {
 		return err
 	}
-	_, err = this.rwc.Write(this.buf.Bytes())
+	_, err = client.rwc.Write(client.buf.Bytes())
 	return err
 }
 
-func (this *FCGIClient) writeBeginRequest(reqId uint16, role uint16, flags uint8) error {
+func (client *FCGIClient) writeBeginRequest(reqId uint16, role uint16, flags uint8) error {
 	b := [8]byte{byte(role >> 8), byte(role), flags}
-	return this.writeRecord(FCGI_BEGIN_REQUEST, reqId, b[:])
+	return client.writeRecord(FCGI_BEGIN_REQUEST, reqId, b[:])
 }
 
-func (this *FCGIClient) writeEndRequest(reqId uint16, appStatus int, protocolStatus uint8) error {
+func (client *FCGIClient) writeEndRequest(reqId uint16, appStatus int, protocolStatus uint8) error {
 	b := make([]byte, 8)
 	binary.BigEndian.PutUint32(b, uint32(appStatus))
 	b[4] = protocolStatus
-	return this.writeRecord(FCGI_END_REQUEST, reqId, b)
+	return client.writeRecord(FCGI_END_REQUEST, reqId, b)
 }
 
 func (client *FCGIClient) writePairs(recType uint8, reqId uint16, pairs map[string]string) error {
@@ -327,26 +327,28 @@ func (w *streamWriter) Close() error {
 
 // FCGIClient.Request send request to fastcgi server and
 // return FCGIResponse from it (including all the records in it)
-func (this *FCGIClient) Request(env map[string]string, reqStr string) (fcgiResponse *FCGIResponse, err error) {
+func (client *FCGIClient) Request(env map[string]string, reqStr string) (fcgiResponse *FCGIResponse, err error) {
 
 	var reqId uint16 = 1
 
-	err = this.writeBeginRequest(reqId, uint16(FCGI_RESPONDER), 0)
+	err = client.writeBeginRequest(reqId, uint16(FCGI_RESPONDER), 0)
 	if err != nil {
 		return
 	}
-	err = this.writePairs(FCGI_PARAMS, reqId, env)
+
+	err = client.writePairs(FCGI_PARAMS, reqId, env)
 	if err != nil {
 		return
 	}
+
 	if len(reqStr) > 0 {
-		err = this.writeRecord(FCGI_STDIN, reqId, []byte(reqStr))
+		err = client.writeRecord(FCGI_STDIN, reqId, []byte(reqStr))
 		if err != nil {
 			return
 		}
 	}
 
-	recReader := newRecordReceiver(this.rwc)
+	recReader := newRecordReceiver(client.rwc)
 	fcgiResponse, err = recReader.receiveRecords()
 	return
 }
@@ -366,7 +368,7 @@ func headers2env(header http.Header) map[string]string {
 }
 
 // FCGIClient.HTTPRequest - receives HTTP Request and send it to FCGI-server
-func (this *FCGIClient) DoHTTPRequest(http_request *http.Request, script_filename string) (*FCGIHTTPResponse, error) {
+func (client *FCGIClient) DoHTTPRequest(http_request *http.Request, script_filename string) (*FCGIHTTPResponse, error) {
 
 	env := make(map[string]string)
 	env["REQUEST_METHOD"] = http_request.Method
@@ -380,12 +382,17 @@ func (this *FCGIClient) DoHTTPRequest(http_request *http.Request, script_filenam
 	env["QUERY_STRING"] = http_request.URL.RawQuery
 
 	// HTTP Headers processing
-	headers_map := headers2env(http_request.Header)
-	for k, v := range headers_map {
+	headers := headers2env(http_request.Header)
+	for k, v := range headers {
 		env[k] = v
 	}
 
-	fcgiResponse, err := this.Request(env, "")
-	http_response, err := fcgiResponse.ParseStdouts()
-	return http_response, err
+	fcgiResponse, err := client.Request(env, "")
+	httpResp, err := fcgiResponse.ParseStdouts()
+	return httpResp, err
+}
+
+func (client *FCGIClient) Close() error {
+	err := client.rwc.Close()
+	return err
 }
